@@ -34,6 +34,7 @@ import { AgentHostStateManager } from './agentHostStateManager.js';
 import { IAgentHostGitService, META_DIFF_BASE_BRANCH } from './agentHostGitService.js';
 import { IAgentHostCheckpointService } from '../common/agentHostCheckpointService.js';
 import { NodeWorkerDiffComputeService } from './diffComputeService.js';
+import { buildGitBlobUri, parseGitBlobUri } from './gitDiffContent.js';
 import { computeSessionDiffs, computeTurnDiffs, type IIncrementalDiffOptions } from './sessionDiffAggregator.js';
 import { META_CHECKPOINT_WORKING_DIR } from './agentHostCheckpointService.js';
 
@@ -64,6 +65,10 @@ function staticChangesetUri(session: ProtocolURI, kind: StaticChangesetKind): Pr
 
 function persistKeyFor(kind: StaticChangesetKind): string {
 	return kind === 'uncommitted' ? META_CHANGESET_UNCOMMITTED : META_CHANGESET_SESSION;
+}
+
+function staticRecomputeKey(session: ProtocolURI, kind: StaticChangesetKind): string {
+	return `${session}\u0000${kind}`;
 }
 
 /**
@@ -258,6 +263,13 @@ export interface IAgentHostChangesetService {
 	refreshUncommittedChangeset(session: ProtocolURI): void;
 
 	/**
+	 * Refreshes uncommitted changesets for all interested sessions rooted at
+	 * `repositoryRoot` using one git diff computation, then rewrites any
+	 * session-scoped `git-blob:` content URIs before publishing per session.
+	 */
+	refreshUncommittedChangesetsForRoot(repositoryRoot: URI, sessions: readonly ProtocolURI[]): void;
+
+	/**
 	 * Lazy refresh of the session (branch) changeset, kicked off when a
 	 * client first subscribes to `<session>/changeset/session` or the
 	 * session URI itself (e.g. Agents Window observing the session). Mirrors
@@ -402,6 +414,32 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
 
 	refreshUncommittedChangeset(session: ProtocolURI): void {
 		this._scheduleStaticRecompute(session, 'uncommitted');
+	}
+
+	refreshUncommittedChangesetsForRoot(repositoryRoot: URI, sessions: readonly ProtocolURI[]): void {
+		const activeSessions = sessions.filter(session => !!this._stateManager.getSessionState(session));
+		if (activeSessions.length === 0) {
+			return;
+		}
+		const canonicalSession = activeSessions[0];
+		let diffs: Promise<readonly ISessionFileDiff[] | undefined> | undefined;
+		const getDiffs = () => diffs ??= this._diffComputationSequencer.queue(
+			`${repositoryRoot.toString()}\u0000uncommitted-root`,
+			() => this._computeUncommittedChangesetsForRoot(repositoryRoot, canonicalSession),
+		);
+		for (const session of activeSessions) {
+			this._diffComputationSequencer.queue(staticRecomputeKey(session, 'uncommitted'), async () => {
+				const rootDiffs = await getDiffs();
+				if (!rootDiffs || !this._stateManager.getSessionState(session)) {
+					return;
+				}
+				try {
+					this._publishRootUncommittedChangesetForSession(session, rootDiffs);
+				} catch (err) {
+					this._logService.warn(`[AgentHostChangesetService] Failed to publish root uncommitted diffs for ${session}`, err);
+				}
+			});
+		}
 	}
 
 	refreshSessionChangeset(session: ProtocolURI): void {
@@ -658,7 +696,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
 	 * but do not fail the turn.
 	 */
 	private _scheduleStaticRecompute(session: ProtocolURI, kind: StaticChangesetKind, changedTurnId?: string): void {
-		this._diffComputationSequencer.queue(`${session}\u0000${kind}`, () => this._doComputeStaticChangeset(session, kind, changedTurnId));
+		this._diffComputationSequencer.queue(staticRecomputeKey(session, kind), () => this._doComputeStaticChangeset(session, kind, changedTurnId));
 	}
 
 	private async _doComputeStaticChangeset(session: ProtocolURI, kind: StaticChangesetKind, changedTurnId?: string): Promise<void> {
@@ -719,6 +757,44 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
 		} finally {
 			ref.dispose();
 		}
+	}
+
+	private async _computeUncommittedChangesetsForRoot(repositoryRoot: URI, canonicalSession: ProtocolURI): Promise<readonly ISessionFileDiff[] | undefined> {
+		try {
+			return await this._gitService.computeSessionFileDiffs(repositoryRoot, { sessionUri: canonicalSession });
+		} catch (err) {
+			this._logService.warn(`[AgentHostChangesetService] git-driven root uncommitted diff computation failed for ${repositoryRoot.toString()}`, err);
+			return undefined;
+		}
+	}
+
+	private _publishRootUncommittedChangesetForSession(session: ProtocolURI, diffs: readonly ISessionFileDiff[]): void {
+		const changesetUri = this._stateManager.registerChangeset(staticChangesetUri(session, 'uncommitted'));
+		const sessionDiffs = diffs.map(diff => this._rewriteGitBlobSessionUri(diff, session));
+		this._publishChangesetDiffs(session, changesetUri, sessionDiffs);
+		this._persistSessionFlag(session, META_CHANGESET_UNCOMMITTED, JSON.stringify(sessionDiffs));
+	}
+
+	private _rewriteGitBlobSessionUri(diff: ISessionFileDiff, session: ProtocolURI): ISessionFileDiff {
+		return {
+			...diff,
+			before: diff.before ? this._rewriteGitBlobSide(diff.before, session) : undefined,
+			after: diff.after ? this._rewriteGitBlobSide(diff.after, session) : undefined,
+		};
+	}
+
+	private _rewriteGitBlobSide(side: NonNullable<ISessionFileDiff['before']>, session: ProtocolURI): NonNullable<ISessionFileDiff['before']> {
+		const parsed = parseGitBlobUri(side.content.uri);
+		if (!parsed) {
+			return side;
+		}
+		return {
+			...side,
+			content: {
+				...side.content,
+				uri: buildGitBlobUri(session, parsed.sha, parsed.repoRelativePath),
+			},
+		};
 	}
 
 	/**

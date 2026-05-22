@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable } from '../../../base/common/lifecycle.js';
+import { SequencerByKey } from '../../../base/common/async.js';
+import { Disposable, DisposableMap, IReference, ReferenceCollection } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
 import { IAgentSessionMetadata } from '../common/agentService.js';
 import {
@@ -14,6 +15,8 @@ import {
 } from '../common/changesetUri.js';
 import { ChangesetStatus } from '../common/state/sessionState.js';
 import { IAgentConfigurationService } from './agentConfigurationService.js';
+import { DEFAULT_AGENT_HOST_WATCH_EXCLUDES, IAgentHostFileMonitorService } from './agentHostFileMonitorService.js';
+import { IAgentHostGitService } from './agentHostGitService.js';
 import { AgentHostStateManager } from './agentHostStateManager.js';
 import {
 	buildCatalogueFromLiveState,
@@ -23,6 +26,24 @@ import {
 	META_CHANGESET_UNCOMMITTED,
 	META_LEGACY_DIFFS,
 } from './agentHostChangesetService.js';
+
+class WatchInterestReferenceCollection extends ReferenceCollection<string> {
+	constructor(
+		private readonly _create: (sessionStr: string) => void,
+		private readonly _destroy: (sessionStr: string) => void,
+	) {
+		super();
+	}
+
+	protected createReferencedObject(sessionStr: string): string {
+		this._create(sessionStr);
+		return sessionStr;
+	}
+
+	protected destroyReferencedObject(sessionStr: string): void {
+		this._destroy(sessionStr);
+	}
+}
 
 /**
  * Raw metadata blob values for the session DB, batch-read by the caller.
@@ -80,10 +101,32 @@ export class ChangesetSessionCoordinator extends Disposable {
 	 */
 	private readonly _subscribedTurns = new Map<string, Set<string>>();
 
+	/** Per-resource references into the per-session watch-interest collection. */
+	private readonly _watchInterestReferences = this._register(new DisposableMap<string, IReference<string>>());
+	private readonly _watchInterestCollection = new WatchInterestReferenceCollection(
+		sessionStr => this._attachWatcherIfPossible(sessionStr),
+		sessionStr => this._destroyWatchInterest(sessionStr),
+	);
+	/** Sessions waiting for materialization before a root watcher can attach. */
+	private readonly _pendingWatchInterest = new Set<string>();
+	/** Session URI string to the working directory that produced the current root attachment. */
+	private readonly _sessionWorkingDirectory = new Map<string, string>();
+	/** Session URI string to repository-root URI string. */
+	private readonly _sessionRoot = new Map<string, string>();
+	/** Repository-root URI string to sessions currently fanned out from that root. */
+	private readonly _rootSessions = new Map<string, Set<string>>();
+	/** Repository-root URI string to the shared monitor acquisition. */
+	private readonly _rootWatchAcquisitions = this._register(new DisposableMap<string>());
+	/** Repository-root URI string to parsed root URI, for root-level refresh calls. */
+	private readonly _rootUris = new Map<string, URI>();
+	private readonly _watchAttachmentSequencer = new SequencerByKey<string>();
+
 	constructor(
 		private readonly _stateManager: AgentHostStateManager,
 		private readonly _changesets: IAgentHostChangesetService,
 		private readonly _configurationService: IAgentConfigurationService,
+		private readonly _fileMonitorService: IAgentHostFileMonitorService,
+		private readonly _gitService: IAgentHostGitService,
 	) {
 		super();
 		this._changesets.setTurnSubscriberProbe((session, turnId) => this.hasTurnSubscribers(session, turnId));
@@ -134,6 +177,7 @@ export class ChangesetSessionCoordinator extends Disposable {
 		// drain the deferred refresh. Idempotent — the per-session
 		// sequencer collapses overlapping computes.
 		this._drainPendingRefresh(sessionStr);
+		this._retryWatchAttachment(sessionStr);
 	}
 
 	/**
@@ -143,6 +187,7 @@ export class ChangesetSessionCoordinator extends Disposable {
 	 */
 	onSessionMaterialized(sessionStr: string): void {
 		this._drainPendingRefresh(sessionStr);
+		this._retryWatchAttachment(sessionStr);
 	}
 
 	/**
@@ -152,6 +197,9 @@ export class ChangesetSessionCoordinator extends Disposable {
 	onSessionDisposed(sessionStr: string): void {
 		this._pendingUncommittedRefreshes.delete(sessionStr);
 		this._subscribedTurns.delete(sessionStr);
+		this._stopWatchInterest(buildUncommittedChangesetUri(sessionStr));
+		this._stopWatchInterest(sessionStr);
+		this._destroyWatchInterest(sessionStr);
 	}
 
 	// ---- Subscription hooks -------------------------------------------------
@@ -170,6 +218,7 @@ export class ChangesetSessionCoordinator extends Disposable {
 		const parsed = parseChangesetUri(resourceStr);
 		if (parsed?.kind === ChangesetKind.Uncommitted) {
 			this._triggerUncommittedRefresh(parsed.sessionUri);
+			this._startWatchInterest(resourceStr, parsed.sessionUri);
 			return;
 		}
 		if (parsed?.kind === ChangesetKind.Session) {
@@ -202,6 +251,7 @@ export class ChangesetSessionCoordinator extends Disposable {
 			// editing files manually in the working tree.
 			this._triggerUncommittedRefresh(resourceStr);
 			this._changesets.refreshSessionChangeset(resourceStr);
+			this._startWatchInterest(resourceStr, resourceStr);
 		}
 	}
 
@@ -211,9 +261,11 @@ export class ChangesetSessionCoordinator extends Disposable {
 	 * subscribed anymore, there's no point firing it on materialize.
 	 */
 	onLastSubscriber(resource: URI): void {
-		const parsed = parseChangesetUri(resource.toString());
+		const resourceStr = resource.toString();
+		const parsed = parseChangesetUri(resourceStr);
 		if (parsed?.kind === ChangesetKind.Uncommitted) {
 			this._pendingUncommittedRefreshes.delete(parsed.sessionUri);
+			this._stopWatchInterest(resourceStr);
 			return;
 		}
 		if (parsed?.kind === ChangesetKind.Turn && parsed.turnId !== undefined) {
@@ -224,6 +276,9 @@ export class ChangesetSessionCoordinator extends Disposable {
 					this._subscribedTurns.delete(parsed.sessionUri);
 				}
 			}
+		}
+		if (!parsed) {
+			this._stopWatchInterest(resourceStr);
 		}
 	}
 
@@ -386,5 +441,126 @@ export class ChangesetSessionCoordinator extends Disposable {
 		if (this._pendingUncommittedRefreshes.delete(sessionStr)) {
 			this._triggerUncommittedRefresh(sessionStr);
 		}
+	}
+
+	private _startWatchInterest(resourceStr: string, sessionStr: string): void {
+		if (!this._watchInterestReferences.has(resourceStr)) {
+			this._watchInterestReferences.set(resourceStr, this._watchInterestCollection.acquire(sessionStr));
+		}
+	}
+
+	private _stopWatchInterest(resourceStr: string): void {
+		this._watchInterestReferences.deleteAndDispose(resourceStr);
+	}
+
+	private _destroyWatchInterest(sessionStr: string): void {
+		this._pendingWatchInterest.delete(sessionStr);
+		this._releaseSessionRoot(sessionStr);
+	}
+
+	private _retryWatchAttachment(sessionStr: string): void {
+		if (this._hasWatchInterest(sessionStr) || this._pendingWatchInterest.has(sessionStr)) {
+			this._attachWatcherIfPossible(sessionStr);
+		}
+	}
+
+	private _hasWatchInterest(sessionStr: string): boolean {
+		return this._watchInterestReferences.has(sessionStr) || this._watchInterestReferences.has(buildUncommittedChangesetUri(sessionStr));
+	}
+
+	private _attachWatcherIfPossible(sessionStr: string): void {
+		this._watchAttachmentSequencer.queue(sessionStr, async () => {
+			if (!this._hasWatchInterest(sessionStr)) {
+				return;
+			}
+			const workingDirectory = this._configurationService.getEffectiveWorkingDirectory(sessionStr);
+			if (!workingDirectory) {
+				this._pendingWatchInterest.add(sessionStr);
+				this._releaseSessionRoot(sessionStr);
+				return;
+			}
+			let workingDirectoryUri: URI;
+			try {
+				workingDirectoryUri = URI.parse(workingDirectory);
+			} catch {
+				this._pendingWatchInterest.add(sessionStr);
+				this._releaseSessionRoot(sessionStr);
+				return;
+			}
+			if (this._sessionRoot.has(sessionStr) && this._sessionWorkingDirectory.get(sessionStr) === workingDirectory) {
+				this._pendingWatchInterest.delete(sessionStr);
+				return;
+			}
+			const repositoryRoot = await this._gitService.getRepositoryRoot(workingDirectoryUri);
+			if (!this._hasWatchInterest(sessionStr)) {
+				return;
+			}
+			if (!repositoryRoot) {
+				this._pendingWatchInterest.delete(sessionStr);
+				this._releaseSessionRoot(sessionStr);
+				return;
+			}
+			this._pendingWatchInterest.delete(sessionStr);
+			this._attachSessionToRoot(sessionStr, repositoryRoot, workingDirectory);
+		});
+	}
+
+	private _attachSessionToRoot(sessionStr: string, repositoryRoot: URI, workingDirectory: string): void {
+		const rootStr = repositoryRoot.toString();
+		if (this._sessionRoot.get(sessionStr) === rootStr) {
+			this._sessionWorkingDirectory.set(sessionStr, workingDirectory);
+			return;
+		}
+		this._releaseSessionRoot(sessionStr);
+		let sessions = this._rootSessions.get(rootStr);
+		if (!sessions) {
+			sessions = new Set<string>();
+			this._rootSessions.set(rootStr, sessions);
+			this._rootUris.set(rootStr, repositoryRoot);
+			this._rootWatchAcquisitions.set(rootStr, this._fileMonitorService.acquire(repositoryRoot, () => this._onRootChanged(rootStr), {
+				excludes: DEFAULT_AGENT_HOST_WATCH_EXCLUDES,
+				debounceMs: 750,
+			}));
+		}
+		sessions.add(sessionStr);
+		this._sessionRoot.set(sessionStr, rootStr);
+		this._sessionWorkingDirectory.set(sessionStr, workingDirectory);
+	}
+
+	private _releaseSessionRoot(sessionStr: string): void {
+		const rootStr = this._sessionRoot.get(sessionStr);
+		if (!rootStr) {
+			this._sessionWorkingDirectory.delete(sessionStr);
+			return;
+		}
+		this._sessionRoot.delete(sessionStr);
+		this._sessionWorkingDirectory.delete(sessionStr);
+		const sessions = this._rootSessions.get(rootStr);
+		if (!sessions) {
+			return;
+		}
+		sessions.delete(sessionStr);
+		if (sessions.size === 0) {
+			this._rootSessions.delete(rootStr);
+			this._rootUris.delete(rootStr);
+			this._rootWatchAcquisitions.deleteAndDispose(rootStr);
+		}
+	}
+
+	private _onRootChanged(rootStr: string): void {
+		const root = this._rootUris.get(rootStr);
+		const sessions = this._rootSessions.get(rootStr);
+		if (!root || !sessions || sessions.size === 0) {
+			return;
+		}
+		const activeSessions = [...sessions].filter(session => {
+			return this._hasWatchInterest(session)
+				&& this._sessionRoot.get(session) === rootStr
+				&& !!this._stateManager.getSessionState(session);
+		});
+		if (activeSessions.length === 0) {
+			return;
+		}
+		this._changesets.refreshUncommittedChangesetsForRoot(root, activeSessions);
 	}
 }

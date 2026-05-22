@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { timeout } from '../../../../base/common/async.js';
+import { DeferredPromise, timeout } from '../../../../base/common/async.js';
 import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -13,7 +13,7 @@ import { NullLogService } from '../../../log/common/log.js';
 import { AgentSession } from '../../common/agentService.js';
 import { buildDefaultChangesetCatalogue } from '../../common/changesetUri.js';
 import { ActionEnvelope, ActionType } from '../../common/state/sessionActions.js';
-import { SessionStatus } from '../../common/state/sessionState.js';
+import { SessionStatus, type ISessionFileDiff } from '../../common/state/sessionState.js';
 import { AgentHostChangesetService } from '../../node/agentHostChangesetService.js';
 import { NULL_CHECKPOINT_SERVICE } from '../../common/agentHostCheckpointService.js';
 import { IAgentHostGitService } from '../../node/agentHostGitService.js';
@@ -21,6 +21,7 @@ import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { SessionDatabase } from '../../node/sessionDatabase.js';
 import { createNoopGitService, createNullSessionDataService, createSessionDataService, TestSessionDatabase } from '../common/sessionTestHelpers.js';
 import { META_CHECKPOINT_WORKING_DIR } from '../../node/agentHostCheckpointService.js';
+import { buildGitBlobUri } from '../../node/gitDiffContent.js';
 
 suite('AgentHostChangesetService', () => {
 
@@ -43,6 +44,27 @@ suite('AgentHostChangesetService', () => {
 			changesets: buildDefaultChangesetCatalogue(sessionUri.toString()),
 		});
 		stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionReady, });
+	}
+
+	function waitForChangesetFileSet(changesetUri: string, fileUri: string): Promise<void> {
+		if (stateManager.getChangesetState(changesetUri)?.files.some(changesetFile => changesetFile.id === fileUri)) {
+			return Promise.resolve();
+		}
+		const deferred = new DeferredPromise<void>();
+		const listener = disposables.add(stateManager.onDidEmitEnvelope(envelope => {
+			if (envelope.channel === changesetUri && envelope.action.type === ActionType.ChangesetFileSet && envelope.action.file.id === fileUri) {
+				listener.dispose();
+				void deferred.complete(undefined);
+			}
+		}));
+		return deferred.p;
+	}
+
+	function gitDiff(fileUri: string, contentUri: string = fileUri): ISessionFileDiff {
+		return {
+			after: { uri: fileUri, content: { uri: contentUri } },
+			diff: { added: 3, removed: 1 },
+		};
 	}
 
 	setup(() => {
@@ -147,6 +169,157 @@ suite('AgentHostChangesetService', () => {
 				uriTemplate: `${sessionStr}/changeset/turn/{turnId}`,
 			},
 		]);
+	});
+
+	test('refreshUncommittedChangesetsForRoot computes once and rewrites git blob URIs per session', async () => {
+		const firstSession = sessionUri.toString();
+		const secondSession = AgentSession.uri('mock', 'session-2').toString();
+		const root = URI.file('/repo');
+		for (const session of [firstSession, secondSession]) {
+			stateManager.createSession({
+				resource: session,
+				provider: 'mock',
+				title: 'Test',
+				status: SessionStatus.Idle,
+				createdAt: Date.now(),
+				modifiedAt: Date.now(),
+				project: { uri: 'file:///test-project', displayName: 'Test Project' },
+				workingDirectory: 'file:///repo',
+				changesets: buildDefaultChangesetCatalogue(session),
+			});
+			stateManager.dispatchServerAction(session, { type: ActionType.SessionReady });
+		}
+
+		const gitCalls: Array<{ workingDirectory: string; sessionUri: string }> = [];
+		const gitService = createNoopGitService();
+		gitService.computeSessionFileDiffs = async (workingDirectory, options) => {
+			gitCalls.push({ workingDirectory: workingDirectory.toString(), sessionUri: options.sessionUri });
+			return [{
+				before: { uri: 'file:///repo/src/a.ts', content: { uri: buildGitBlobUri(firstSession, 'abc123', 'src/a.ts') } },
+				after: { uri: 'file:///repo/src/a.ts', content: { uri: 'file:///repo/src/a.ts' } },
+				diff: { added: 3, removed: 1 },
+			}];
+		};
+		const svc = disposables.add(new AgentHostChangesetService(
+			stateManager,
+			new NullLogService(),
+			createSessionDataService(new TestSessionDatabase()),
+			gitService,
+			NULL_CHECKPOINT_SERVICE,
+		));
+
+		const secondFileSet = waitForChangesetFileSet(`${secondSession}/changeset/uncommitted`, 'file:///repo/src/a.ts');
+		svc.refreshUncommittedChangesetsForRoot(root, [firstSession, secondSession]);
+		await secondFileSet;
+
+		const firstState = stateManager.getChangesetState(`${firstSession}/changeset/uncommitted`);
+		const secondState = stateManager.getChangesetState(`${secondSession}/changeset/uncommitted`);
+		assert.deepStrictEqual({
+			gitCalls,
+			firstContent: firstState?.files[0]?.edit.before?.content.uri,
+			secondContent: secondState?.files[0]?.edit.before?.content.uri,
+			secondSummary: stateManager.getSessionState(secondSession)?.summary.changesets?.find(c => c.uriTemplate === `${secondSession}/changeset/uncommitted`),
+		}, {
+			gitCalls: [{ workingDirectory: root.toString(), sessionUri: firstSession }],
+			firstContent: buildGitBlobUri(firstSession, 'abc123', 'src/a.ts'),
+			secondContent: buildGitBlobUri(secondSession, 'abc123', 'src/a.ts'),
+			secondSummary: {
+				label: 'Uncommitted Changes',
+				description: 'Show uncommitted changes in this session',
+				uriTemplate: `${secondSession}/changeset/uncommitted`,
+				additions: 3,
+				deletions: 1,
+				files: 1,
+			},
+		});
+	});
+
+	test('root uncommitted refresh serializes with later per-session refreshes', async () => {
+		const sessionStr = sessionUri.toString();
+		setupSession('file:///repo');
+
+		const root = URI.file('/repo');
+		const rootGate = new DeferredPromise<void>();
+		const gitCalls: string[] = [];
+		const gitService = createNoopGitService();
+		gitService.computeSessionFileDiffs = async () => {
+			gitCalls.push(gitCalls.length === 0 ? 'root' : 'direct');
+			if (gitCalls.length === 1) {
+				await rootGate.p;
+				return [gitDiff('file:///repo/root.ts')];
+			}
+			return [gitDiff('file:///repo/direct.ts')];
+		};
+		const svc = disposables.add(new AgentHostChangesetService(
+			stateManager,
+			new NullLogService(),
+			createSessionDataService(new TestSessionDatabase()),
+			gitService,
+			NULL_CHECKPOINT_SERVICE,
+		));
+
+		const uncommittedUri = `${sessionStr}/changeset/uncommitted`;
+		const rootFileSet = waitForChangesetFileSet(uncommittedUri, 'file:///repo/root.ts');
+		const directFileSet = waitForChangesetFileSet(uncommittedUri, 'file:///repo/direct.ts');
+		svc.refreshUncommittedChangesetsForRoot(root, [sessionStr]);
+		svc.refreshUncommittedChangeset(sessionStr);
+		await rootGate.complete(undefined);
+		await Promise.all([rootFileSet, directFileSet]);
+
+		assert.deepStrictEqual({
+			gitCalls,
+			files: stateManager.getChangesetState(uncommittedUri)?.files.map(changesetFile => changesetFile.id),
+		}, {
+			gitCalls: ['root', 'direct'],
+			files: ['file:///repo/direct.ts'],
+		});
+	});
+
+	test('root uncommitted refresh isolates per-session publish failures', async () => {
+		const firstSession = sessionUri.toString();
+		const secondSession = AgentSession.uri('mock', 'session-2').toString();
+		const root = URI.file('/repo');
+		for (const session of [firstSession, secondSession]) {
+			stateManager.createSession({
+				resource: session,
+				provider: 'mock',
+				title: 'Test',
+				status: SessionStatus.Idle,
+				createdAt: Date.now(),
+				modifiedAt: Date.now(),
+				project: { uri: 'file:///test-project', displayName: 'Test Project' },
+				workingDirectory: 'file:///repo',
+				changesets: buildDefaultChangesetCatalogue(session),
+			});
+			stateManager.dispatchServerAction(session, { type: ActionType.SessionReady });
+		}
+
+		const gitService = createNoopGitService();
+		gitService.computeSessionFileDiffs = async () => [gitDiff('file:///repo/src/a.ts')];
+		const sessionDataService = createSessionDataService(new TestSessionDatabase());
+		const openDatabase = sessionDataService.openDatabase;
+		sessionDataService.openDatabase = session => {
+			if (session.toString() === firstSession) {
+				throw new Error('persist failed');
+			}
+			return openDatabase(session);
+		};
+		const svc = disposables.add(new AgentHostChangesetService(
+			stateManager,
+			new NullLogService(),
+			sessionDataService,
+			gitService,
+			NULL_CHECKPOINT_SERVICE,
+		));
+
+		const secondFileSet = waitForChangesetFileSet(`${secondSession}/changeset/uncommitted`, 'file:///repo/src/a.ts');
+		svc.refreshUncommittedChangesetsForRoot(root, [firstSession, secondSession]);
+		await secondFileSet;
+
+		assert.deepStrictEqual(
+			stateManager.getChangesetState(`${secondSession}/changeset/uncommitted`)?.files.map(changesetFile => changesetFile.id),
+			['file:///repo/src/a.ts'],
+		);
 	});
 
 	test('restoreStaticChangeset catalogue counts only emitted unique files', () => {
