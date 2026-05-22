@@ -33,6 +33,7 @@ import { IProductService } from '../../product/common/productService.js';
 import { InstantiationService } from '../../instantiation/common/instantiationService.js';
 import { ServiceCollection } from '../../instantiation/common/serviceCollection.js';
 import { CopilotAgent } from './copilot/copilotAgent.js';
+import { AgentHostOctoKitService, IAgentHostOctoKitService } from './shared/agentHostOctoKitService.js';
 import { CopilotApiService, ICopilotApiService } from './shared/copilotApiService.js';
 import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeAgentSdkService, IClaudeAgentSdkService } from './claude/claudeAgentSdkService.js';
@@ -40,12 +41,13 @@ import { ClaudeProxyService, IClaudeProxyService } from './claude/claudeProxySer
 import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
 import { AgentHostOTelService } from './otel/agentHostOTelService.js';
 import { AgentService } from './agentService.js';
-import { AgentHostClaudeSdkPathEnvVar } from '../common/agentService.js';
+import { AgentHostClaudeSdkPathEnvVar, IAgentService } from '../common/agentService.js';
 import { IAgentConfigurationService } from './agentConfigurationService.js';
 import { IAgentHostCompletions } from './agentHostCompletions.js';
 import { IAgentHostTerminalManager } from './agentHostTerminalManager.js';
 import { WebSocketProtocolServer } from './webSocketTransport.js';
 import { ProtocolServerHandler } from './protocolServerHandler.js';
+import { AgentHostPullRequestOperationHandler } from './agentHostPullRequestOperationHandler.js';
 import { FileService } from '../../files/common/fileService.js';
 import { IFileService } from '../../files/common/files.js';
 import { DiskFileSystemProvider } from '../../files/node/diskFileSystemProvider.js';
@@ -213,6 +215,7 @@ async function main(): Promise<void> {
 	// Create the agent service (owns AgentHostStateManager + AgentSideEffects internally)
 	const agentService = new AgentService(logService, fileService, sessionDataService, productService, gitService, checkpointService, rootConfigResource, telemetryService);
 	disposables.add(agentService);
+	diServices.set(IAgentService, agentService);
 
 	// Register agents
 	if (!options.quiet) {
@@ -228,6 +231,8 @@ async function main(): Promise<void> {
 		// the proxy service constructor requires it.
 		const copilotApiService = instantiationService.createInstance(CopilotApiService, undefined);
 		diServices.set(ICopilotApiService, copilotApiService);
+		const agentHostOctoKitService = instantiationService.createInstance(AgentHostOctoKitService, undefined);
+		diServices.set(IAgentHostOctoKitService, agentHostOctoKitService);
 		const claudeProxyService = disposables.add(instantiationService.createInstance(ClaudeProxyService));
 		diServices.set(IClaudeProxyService, claudeProxyService);
 		const claudeAgentSdkService = instantiationService.createInstance(ClaudeAgentSdkService);
@@ -283,6 +288,12 @@ async function main(): Promise<void> {
 		clientFileSystemProvider,
 		logService,
 	));
+
+	// Register pull request changeset operation handlers (git repos only; advertised by AgentService).
+	const createPrHandler = instantiationService.createInstance(AgentHostPullRequestOperationHandler, false, agentService.stateManager);
+	const createDraftPrHandler = instantiationService.createInstance(AgentHostPullRequestOperationHandler, true, agentService.stateManager);
+	disposables.add(agentService.registerChangesetOperationHandler(AgentHostPullRequestOperationHandler.OPERATION_CREATE_PR, createPrHandler));
+	disposables.add(agentService.registerChangesetOperationHandler(AgentHostPullRequestOperationHandler.OPERATION_CREATE_DRAFT_PR, createDraftPrHandler));
 
 	// Report ready
 	function reportReady(addr: string): void {

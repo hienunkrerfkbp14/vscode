@@ -5,6 +5,7 @@
 
 import { decodeBase64, VSBuffer } from '../../../base/common/buffer.js';
 import { disposableTimeout } from '../../../base/common/async.js';
+import { CancellationToken } from '../../../base/common/cancellation.js';
 import { toErrorMessage } from '../../../base/common/errorMessage.js';
 import { Emitter } from '../../../base/common/event.js';
 import { Disposable, DisposableResourceMap, DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
@@ -23,11 +24,13 @@ import { AgentProvider, AgentSession, IAgent, IAgentCreateSessionConfig, IAgentM
 import { ISessionDataService, SESSION_ATTACHMENTS_DIRNAME } from '../common/sessionDataService.js';
 import { buildDefaultChangesetCatalogue, buildSessionChangesetUri, buildUncommittedChangesetUri, formatSessionChangesetDescription } from '../common/changesetUri.js';
 import { ActionType, ActionEnvelope, INotification, type IRootConfigChangedAction, type SessionAction, type TerminalAction } from '../common/state/sessionActions.js';
+import { localize } from '../../../nls.js';
 import type { CompletionsParams, CompletionsResult, CreateTerminalParams, ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../common/state/protocol/commands.js';
-import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, ProtocolError, type DirectoryEntry, type ResourceCopyParams, type ResourceCopyResult, type ResourceDeleteParams, type ResourceDeleteResult, type ResourceListResult, type ResourceMoveParams, type ResourceMoveResult, type ResourceReadResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../common/state/sessionProtocol.js';
+import type { InvokeChangesetOperationParams, InvokeChangesetOperationResult } from '../common/state/protocol/channels-changeset/commands.js';
+import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, JsonRpcErrorCodes, ProtocolError, type DirectoryEntry, type ResourceCopyParams, type ResourceCopyResult, type ResourceDeleteParams, type ResourceDeleteResult, type ResourceListResult, type ResourceMoveParams, type ResourceMoveResult, type ResourceReadResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../common/state/sessionProtocol.js';
 import { MessageAttachmentKind, type MessageAttachment, type MessageResourceAttachment } from '../common/state/protocol/state.js';
 import type { SessionPendingMessageSetAction, SessionTurnStartedAction } from '../common/state/protocol/actions.js';
-import { ResponsePartKind, SessionStatus, ToolCallStatus, ToolResultContentType, buildSubagentSessionUriPrefix, parseSubagentSessionUri, readSessionGitState, withSessionGitState, type SessionConfigState, type SessionSummary, type ToolResultSubagentContent, type Turn } from '../common/state/sessionState.js';
+import { ResponsePartKind, SessionStatus, ToolCallStatus, ToolResultContentType, buildSubagentSessionUriPrefix, parseSubagentSessionUri, readSessionGitState, withSessionGitState, ChangesetOperationScope, ChangesetOperationTargetKind, type ChangesetOperation, type SessionConfigState, type SessionSummary, type ToolResultSubagentContent, type Turn } from '../common/state/sessionState.js';
 import { IProductService } from '../../product/common/productService.js';
 import { AgentConfigurationService, IAgentConfigurationService } from './agentConfigurationService.js';
 import { AgentHostTerminalManager, type IAgentHostTerminalManager } from './agentHostTerminalManager.js';
@@ -57,6 +60,23 @@ import { updateAgentHostTelemetryLevelFromConfig } from './agentHostTelemetrySer
 const SESSION_GC_GRACE_MS = 30_000;
 
 /**
+ * Server-side handler for a {@link ChangesetOperation} advertised via
+ * `changeset/operationsChanged`. The agent service validates the request
+ * shape (changeset exists, operation id known, target scope matches)
+ * before invoking the handler; the handler is only responsible for
+ * executing the operation.
+ *
+ * Handlers SHOULD throw {@link ProtocolError} with `AHP_AUTH_REQUIRED`
+ * (and the relevant `ProtectedResourceMetadata` as `data`) when a
+ * required token is missing from the agent host's auth store — the
+ * workbench-side bridge catches this and prompts the user before
+ * retrying the RPC.
+ */
+export interface IChangesetOperationHandler {
+	invoke(params: InvokeChangesetOperationParams, token: CancellationToken): Promise<InvokeChangesetOperationResult>;
+}
+
+/**
  * The agent service implementation that runs inside the agent-host utility
  * process. Dispatches to registered {@link IAgent} instances based
  * on the provider identifier in the session configuration.
@@ -83,6 +103,15 @@ export class AgentService extends Disposable implements IAgentService {
 
 	/** Registered providers keyed by their {@link AgentProvider} id. */
 	private readonly _providers = new Map<AgentProvider, IAgent>();
+	/**
+	 * Most-recently pushed bearer token for each {@link AuthenticateParams.resource}.
+	 * Mirrors what is fanned out to per-agent `authenticate(...)` so service-level
+	 * consumers (e.g. changeset operation handlers) can read tokens for resources
+	 * not tied to a specific agent.
+	 */
+	private readonly _authTokens = new Map<string, string>();
+	/** Registered changeset operation handlers, keyed by operation id. */
+	private readonly _changesetOperationHandlers = new Map<string, IChangesetOperationHandler>();
 	/** Maps each active session URI (toString) to its owning provider. */
 	private readonly _sessionToProvider = new Map<string, AgentProvider>();
 	/** Subscriptions to provider progress events; cleared when providers change. */
@@ -280,7 +309,66 @@ export class AgentService extends Disposable implements IAgentService {
 				);
 			}
 		}
+		// Resources not claimed by any agent (e.g. GITHUB_REPO_PROTECTED_RESOURCE)
+		// are still acceptable — the agent host stores the token for later
+		// service-level consumers (changeset operation handlers, etc.).
+		if (matching.length === 0) {
+			authenticated = true;
+		}
+		if (authenticated) {
+			this._authTokens.set(params.resource, params.token);
+		}
 		return { authenticated };
+	}
+
+	getAuthToken(resource: string): string | undefined {
+		return this._authTokens.get(resource);
+	}
+
+	// ---- Changeset operation handlers --------------------------------------
+
+	/**
+	 * Registers a {@link IChangesetOperationHandler} for the given
+	 * `operationId`. Invoked from {@link invokeChangesetOperation} after
+	 * protocol-level validation. Throws if a handler is already registered
+	 * for `operationId`.
+	 */
+	public registerChangesetOperationHandler(operationId: string, handler: IChangesetOperationHandler): IDisposable {
+		if (this._changesetOperationHandlers.has(operationId)) {
+			throw new Error(`Changeset operation handler already registered for '${operationId}'`);
+		}
+		this._changesetOperationHandlers.set(operationId, handler);
+		return {
+			dispose: () => {
+				if (this._changesetOperationHandlers.get(operationId) === handler) {
+					this._changesetOperationHandlers.delete(operationId);
+				}
+			}
+		};
+	}
+
+	async invokeChangesetOperation(params: InvokeChangesetOperationParams): Promise<InvokeChangesetOperationResult> {
+		const state = this._stateManager.getChangesetState(params.channel);
+		if (!state) {
+			throw new ProtocolError(AHP_SESSION_NOT_FOUND, `Changeset not found: ${params.channel}`);
+		}
+		const op = state.operations?.find(o => o.id === params.operationId);
+		if (!op) {
+			throw new ProtocolError(JsonRpcErrorCodes.InvalidParams, `Unknown operation '${params.operationId}' on changeset ${params.channel}`);
+		}
+		const targetKind: ChangesetOperationScope = params.target?.kind === ChangesetOperationTargetKind.Resource
+			? ChangesetOperationScope.Resource
+			: params.target?.kind === ChangesetOperationTargetKind.Range
+				? ChangesetOperationScope.Range
+				: ChangesetOperationScope.Changeset;
+		if (!op.scopes.includes(targetKind)) {
+			throw new ProtocolError(JsonRpcErrorCodes.InvalidParams, `Operation '${params.operationId}' does not support scope '${targetKind}' (allowed: ${op.scopes.join(', ')})`);
+		}
+		const handler = this._changesetOperationHandlers.get(params.operationId);
+		if (!handler) {
+			throw new ProtocolError(JsonRpcErrorCodes.InternalError, `No operation handler registered for '${params.operationId}' on changeset ${params.channel}`);
+		}
+		return handler.invoke(params, CancellationToken.None);
 	}
 
 	// ---- session management -------------------------------------------------
@@ -611,6 +699,7 @@ export class AgentService extends Disposable implements IAgentService {
 				const next = withSessionGitState(current, gitState);
 				this._stateManager.setSessionMeta(sessionKey, next);
 				this._updateBranchChangesetDescription(sessionKey, gitState);
+				this._updateBranchChangesetOperations(sessionKey, gitState);
 			},
 			e => {
 				this._logService.warn(`[AgentService] Failed to compute git state for ${session}`, e);
@@ -679,6 +768,43 @@ export class AgentService extends Disposable implements IAgentService {
 			return;
 		}
 		this._stateManager.setSessionChangesets(sessionKey, next);
+	}
+
+	/**
+	 * Advertises the `create-pr` / `create-draft-pr` changeset operations
+	 * on the session's `Branch Changes` changeset when the working copy
+	 * is a git repo with a GitHub remote, and strips them otherwise.
+	 *
+	 * The operations are intentionally **not** advertised at the agent
+	 * level (via `IAgent.getProtectedResources()`) because they are a
+	 * property of the changeset, not the agent — the same buttons apply
+	 * to any agent operating on a GitHub-backed worktree. The repo-scoped
+	 * GitHub token ({@link GITHUB_REPO_PROTECTED_RESOURCE}) is acquired
+	 * lazily by the workbench-side `invokeChangesetOperation` retry path
+	 * when the operation handler throws `AHP_AUTH_REQUIRED`.
+	 */
+	private _updateBranchChangesetOperations(sessionKey: string, gitState: { hasGitHubRemote?: boolean }): void {
+		const branchUri = buildSessionChangesetUri(sessionKey);
+		const operations: ChangesetOperation[] | undefined = gitState.hasGitHubRemote
+			? [
+				{
+					id: 'create-pr',
+					label: localize('agentHost.changeset.createPR', "Create Pull Request"),
+					scopes: [ChangesetOperationScope.Changeset],
+					icon: 'git-pull-request',
+				},
+				{
+					id: 'create-draft-pr',
+					label: localize('agentHost.changeset.createDraftPR', "Create Draft Pull Request"),
+					scopes: [ChangesetOperationScope.Changeset],
+					icon: 'git-pull-request-draft',
+				},
+			]
+			: undefined;
+		this._stateManager.dispatchServerAction(branchUri, {
+			type: ActionType.ChangesetOperationsChanged,
+			operations,
+		});
 	}
 
 	private _persistConfigValues(session: URI, values: Record<string, unknown>): void {
